@@ -1,0 +1,197 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  SCHEME: Amar Avro Keyboard
+  PROJECT: AvroKeyboard.xcodeproj
+  APP_NAME: Amar Avro Keyboard
+  PRODUCTS_DIR: build/Build/Products/Release
+  # Signing/notarization only runs when the secrets are present (they are not
+  # exposed to pull requests from forks); otherwise the app is ad-hoc signed.
+  HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: apple-silicon
+            archs: arm64
+          - name: intel
+            archs: x86_64
+          - name: universal
+            archs: arm64 x86_64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app && xcodebuild -version
+
+      - name: Import Developer ID certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          CERT="$RUNNER_TEMP/certificate.p12"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERT"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -P "$MACOS_CERTIFICATE_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$CERT"
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Build (Developer ID)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -derivedDataPath build \
+            ARCHS="${{ matrix.archs }}" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            ENABLE_HARDENED_RUNTIME=YES \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+            OTHER_CODE_SIGN_FLAGS="--timestamp" \
+            -quiet build
+
+      - name: Build (ad-hoc)
+        if: env.HAS_SIGNING != 'true'
+        run: |
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -derivedDataPath build \
+            ARCHS="${{ matrix.archs }}" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY=- \
+            -quiet build
+
+      - name: Verify input method metadata
+        run: |
+          APP="$PRODUCTS_DIR/$APP_NAME.app"
+          PLIST="$APP/Contents/Info.plist"
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Print :InputMethodConnectionName' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Print :InputMethodServerControllerClass' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Print :TISIntendedLanguage' "$PLIST"
+          /usr/libexec/PlistBuddy -c 'Print :tsInputMethodCharacterRepertoireKey' "$PLIST"
+          test -f "$APP/Contents/Resources/Assets.car"
+
+      - name: Verify build
+        run: |
+          APP="$PRODUCTS_DIR/$APP_NAME.app"
+          lipo -info "$APP/Contents/MacOS/$APP_NAME"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --display --verbose=2 "$APP" 2>&1 | grep -E "^(Authority|Identifier|TeamIdentifier|Timestamp|CodeDirectory)"
+          echo "Entitlements:"; codesign --display --entitlements - --xml "$APP" 2>/dev/null || true
+
+      - name: Notarize app
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+        run: |
+          echo "$APP_STORE_CONNECT_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          APP="$PRODUCTS_DIR/$APP_NAME.app"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize-app.zip"
+          bash scripts/notarize.sh "$RUNNER_TEMP/notarize-app.zip"
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=2 "$APP"
+
+      - name: Create DMG
+        run: bash scripts/make-dmg.sh "$PRODUCTS_DIR/$APP_NAME.app" "$PRODUCTS_DIR/Amar-Avro-Keyboard-${{ matrix.name }}.dmg"
+
+      - name: Sign and notarize DMG
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          DMG="$PRODUCTS_DIR/Amar-Avro-Keyboard-${{ matrix.name }}.dmg"
+          codesign --sign "Developer ID Application" --timestamp --verbose=2 "$DMG"
+          bash scripts/notarize.sh "$DMG"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Package
+        run: |
+          cd "$PRODUCTS_DIR"
+          ditto -c -k --keepParent "$APP_NAME.app" "Amar-Avro-Keyboard-${{ matrix.name }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Amar-Avro-Keyboard-${{ matrix.name }}
+          path: |
+            ${{ env.PRODUCTS_DIR }}/Amar-Avro-Keyboard-${{ matrix.name }}.zip
+            ${{ env.PRODUCTS_DIR }}/Amar-Avro-Keyboard-${{ matrix.name }}.dmg
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove signing keychain
+        if: always() && env.KEYCHAIN != ''
+        run: security delete-keychain "$KEYCHAIN"
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: Amar-Avro-Keyboard-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.dmg *.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la dist
+          gh release create "$TAG" dist/*.dmg dist/*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag
